@@ -18,12 +18,16 @@ Configuration in config.yaml:
 """
 
 import asyncio
+import inspect
+import json
 import logging
 import os
 import re
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 try:
     import dingtalk_stream
@@ -54,7 +58,20 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 20000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
-_DINGTALK_WEBHOOK_RE = re.compile(r'^https://api\.dingtalk\.com/')
+_DINGTALK_WEBHOOK_HOSTS = {"api.dingtalk.com", "oapi.dingtalk.com"}
+
+
+def _is_valid_session_webhook(url: str) -> bool:
+    """Allow only official DingTalk session webhook origins."""
+    if not url:
+        return False
+    try:
+        parsed = urlsplit(url)
+    except Exception:
+        return False
+    if parsed.scheme != "https":
+        return False
+    return (parsed.hostname or "").lower() in _DINGTALK_WEBHOOK_HOSTS
 
 
 def check_dingtalk_requirements() -> bool:
@@ -86,6 +103,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._stream_client: Any = None
         self._stream_task: Optional[asyncio.Task] = None
         self._http_client: Optional["httpx.AsyncClient"] = None
+        self._stream_thread_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Message deduplication
         self._dedup = MessageDeduplicator(max_size=1000)
@@ -128,12 +146,13 @@ class DingTalkAdapter(BasePlatformAdapter):
             return False
 
     async def _run_stream(self) -> None:
-        """Run the blocking stream client with auto-reconnection."""
+        """Run the stream client with auto-reconnection."""
         backoff_idx = 0
         while self._running:
             try:
                 logger.debug("[%s] Starting stream client...", self.name)
-                await asyncio.to_thread(self._stream_client.start)
+                await asyncio.to_thread(self._run_stream_client)
+                backoff_idx = 0
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -149,6 +168,37 @@ class DingTalkAdapter(BasePlatformAdapter):
             await asyncio.sleep(delay)
             backoff_idx += 1
 
+    def _run_stream_client(self) -> None:
+        """Run the SDK client in its own thread-local event loop.
+
+        Newer dingtalk-stream releases expose ``start()`` as ``async def`` and
+        keep their websocket loop on that event loop. Older releases use a
+        synchronous blocking ``start()``. This wrapper supports both.
+        """
+        loop = asyncio.new_event_loop()
+        self._stream_thread_loop = loop
+        try:
+            asyncio.set_event_loop(loop)
+            start_result = self._stream_client.start()
+            if inspect.isawaitable(start_result):
+                loop.run_until_complete(start_result)
+            else:
+                # Older SDKs block inside start(); no extra loop work needed.
+                return
+        finally:
+            try:
+                pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                logger.debug("[%s] Error draining DingTalk stream loop", self.name, exc_info=True)
+            finally:
+                self._stream_thread_loop = None
+                asyncio.set_event_loop(None)
+                loop.close()
+
     async def disconnect(self) -> None:
         """Disconnect from DingTalk."""
         self._running = False
@@ -161,6 +211,29 @@ class DingTalkAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._stream_task = None
+
+        stream_client = self._stream_client
+        stream_loop = self._stream_thread_loop
+        if stream_client is not None:
+            close_fn = (
+                getattr(stream_client, "stop", None)
+                or getattr(stream_client, "close", None)
+                or getattr(stream_client, "disconnect", None)
+            )
+            if close_fn:
+                try:
+                    if stream_loop and not stream_loop.is_closed():
+                        if inspect.iscoroutinefunction(close_fn):
+                            future = asyncio.run_coroutine_threadsafe(close_fn(), stream_loop)
+                            await asyncio.wrap_future(future)
+                        else:
+                            await asyncio.to_thread(close_fn)
+                    elif inspect.iscoroutinefunction(close_fn):
+                        await close_fn()
+                    else:
+                        await asyncio.to_thread(close_fn)
+                except Exception:
+                    logger.debug("[%s] Error stopping DingTalk stream client", self.name, exc_info=True)
 
         if self._http_client:
             await self._http_client.aclose()
@@ -198,7 +271,7 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         # Store session webhook for reply routing (validate origin to prevent SSRF)
         session_webhook = getattr(message, "session_webhook", None) or ""
-        if session_webhook and chat_id and _DINGTALK_WEBHOOK_RE.match(session_webhook):
+        if session_webhook and chat_id and _is_valid_session_webhook(session_webhook):
             if len(self._session_webhooks) >= _SESSION_WEBHOOKS_MAX:
                 # Evict oldest entry to cap memory growth
                 try:
@@ -314,20 +387,54 @@ class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
         self._adapter = adapter
         self._loop = loop
 
-    def process(self, message: "ChatbotMessage"):
-        """Called by dingtalk-stream in its thread when a message arrives.
-
-        Schedules the async handler on the main event loop.
-        """
+    async def process(self, message: Any):
+        """Called by dingtalk-stream when a message arrives."""
         loop = self._loop
         if loop is None or loop.is_closed():
             logger.error("[DingTalk] Event loop unavailable, cannot dispatch message")
             return dingtalk_stream.AckMessage.STATUS_OK, "OK"
 
-        future = asyncio.run_coroutine_threadsafe(self._adapter._on_message(message), loop)
+        normalized = self._normalize_message(message)
+        future = asyncio.run_coroutine_threadsafe(self._adapter._on_message(normalized), loop)
         try:
-            future.result(timeout=60)
+            await asyncio.wrap_future(future)
         except Exception:
             logger.exception("[DingTalk] Error processing incoming message")
 
         return dingtalk_stream.AckMessage.STATUS_OK, "OK"
+
+    @staticmethod
+    def _normalize_message(message: Any) -> Any:
+        """Normalize CallbackMessage payloads to the ChatbotMessage shape Hermes expects."""
+        data = getattr(message, "data", None)
+        if data is None:
+            return message
+
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                logger.debug("[DingTalk] Failed to decode callback payload as JSON")
+                data = {}
+        if not isinstance(data, dict):
+            return message
+
+        text = data.get("text", {})
+        if isinstance(text, str):
+            text = {"content": text}
+
+        return SimpleNamespace(
+            message_id=data.get("msgId", "") or data.get("messageId", ""),
+            text=text,
+            rich_text=data.get("richText"),
+            sender_id=data.get("senderId", ""),
+            sender_nick=data.get("senderNick", ""),
+            sender_staff_id=data.get("senderStaffId", ""),
+            conversation_id=data.get("conversationId", ""),
+            conversation_type=str(data.get("conversationType", "") or ""),
+            conversation_title=data.get("conversationTitle", ""),
+            session_webhook=data.get("sessionWebhook", ""),
+            create_at=data.get("createAt", ""),
+            raw_message=message,
+            data=data,
+        )

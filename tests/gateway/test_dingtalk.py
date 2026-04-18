@@ -1,7 +1,9 @@
 """Tests for DingTalk platform adapter."""
 import asyncio
 import json
+from concurrent.futures import Future
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import pytest
@@ -107,6 +109,26 @@ class TestExtractText:
         msg.text = ""
         msg.rich_text = None
         assert DingTalkAdapter._extract_text(msg) == ""
+
+
+# ---------------------------------------------------------------------------
+# Session webhook validation
+# ---------------------------------------------------------------------------
+
+
+class TestSessionWebhookValidation:
+
+    def test_accepts_api_dingtalk_webhook(self):
+        from gateway.platforms.dingtalk import _is_valid_session_webhook
+        assert _is_valid_session_webhook("https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend") is True
+
+    def test_accepts_oapi_dingtalk_webhook(self):
+        from gateway.platforms.dingtalk import _is_valid_session_webhook
+        assert _is_valid_session_webhook("https://oapi.dingtalk.com/robot/sendBySession?session=abc") is True
+
+    def test_rejects_non_dingtalk_host(self):
+        from gateway.platforms.dingtalk import _is_valid_session_webhook
+        assert _is_valid_session_webhook("https://example.com/robot/sendBySession?session=abc") is False
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +284,99 @@ class TestConnect:
         assert len(adapter._session_webhooks) == 0
         assert len(adapter._dedup._seen) == 0
         assert adapter._http_client is None
+
+    @pytest.mark.asyncio
+    async def test_run_stream_supports_async_start(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        seen = []
+
+        async def fake_start():
+            seen.append("started")
+
+        adapter._stream_client = SimpleNamespace(start=fake_start)
+        await asyncio.to_thread(adapter._run_stream_client)
+
+        assert seen == ["started"]
+
+
+# ---------------------------------------------------------------------------
+# Incoming handler compatibility
+# ---------------------------------------------------------------------------
+
+
+class TestIncomingHandler:
+
+    @pytest.mark.asyncio
+    async def test_process_normalizes_callback_message_data(self, monkeypatch):
+        from gateway.platforms import dingtalk as dingtalk_module
+
+        adapter = MagicMock()
+        adapter._on_message = AsyncMock()
+
+        class LoopStub:
+            def is_closed(self):
+                return False
+
+        def run_coroutine_threadsafe(coro, loop):
+            task = asyncio.create_task(coro)
+            future = Future()
+
+            def finish(done_task):
+                try:
+                    future.set_result(done_task.result())
+                except Exception as exc:
+                    future.set_exception(exc)
+
+            task.add_done_callback(finish)
+            return future
+
+        monkeypatch.setattr(
+            dingtalk_module.asyncio,
+            "run_coroutine_threadsafe",
+            run_coroutine_threadsafe,
+        )
+
+        monkeypatch.setattr(
+            dingtalk_module,
+            "dingtalk_stream",
+            SimpleNamespace(AckMessage=SimpleNamespace(STATUS_OK="OK")),
+        )
+
+        handler = dingtalk_module._IncomingHandler(adapter, LoopStub())
+        callback_message = SimpleNamespace(
+            data=json.dumps(
+                {
+                    "msgId": "mid-1",
+                    "text": {"content": "hello"},
+                    "senderId": "user-1",
+                    "senderNick": "Alice",
+                    "senderStaffId": "staff-1",
+                    "conversationId": "conv-1",
+                    "conversationType": "2",
+                    "conversationTitle": "Team Chat",
+                    "sessionWebhook": "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+                    "createAt": "1710000000000",
+                }
+            )
+        )
+
+        status = await handler.process(callback_message)
+
+        adapter._on_message.assert_awaited_once()
+        normalized = adapter._on_message.await_args.args[0]
+        assert normalized.message_id == "mid-1"
+        assert normalized.text == {"content": "hello"}
+        assert normalized.sender_id == "user-1"
+        assert normalized.sender_nick == "Alice"
+        assert normalized.sender_staff_id == "staff-1"
+        assert normalized.conversation_id == "conv-1"
+        assert normalized.conversation_type == "2"
+        assert normalized.conversation_title == "Team Chat"
+        assert normalized.session_webhook.startswith("https://api.dingtalk.com/")
+        assert normalized.create_at == "1710000000000"
+        assert status == ("OK", "OK")
 
 
 # ---------------------------------------------------------------------------
